@@ -1,0 +1,47 @@
+# Engine BISINDO — berjalan berdampingan dengan kampus-meet di server yang sama.
+#
+# Perbedaan penting dari compose bawaan paket ini:
+#  - PostgreSQL TIDAK lagi dipublikasikan ke semua antarmuka (bawaan: "5432:5432" = publik)
+#  - Port aplikasi dipindah dari 3000 (sudah dipakai kampus-meet) dan dikunci ke 127.0.0.1
+#  - schema.sql tidak di-mount sebagai initdb, karena dump lengkap sudah memuat skema
+#  - CPU dibatasi agar tidak merebut jatah LiveKit/Egress di server 4 core ini
+#
+# Jalankan:  docker compose --env-file .env up -d --build
+services:
+  bisindo-db:
+    image: postgres:16-alpine          # samakan dengan versi dump (pg_dump 16.15)
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE}
+      POSTGRES_USER: ${PGUSER}
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+    ports: ["127.0.0.1:55432:5432"]    # 55432 agar tidak bentrok bila kelak ada PostgreSQL lain
+    volumes:
+      - bisindo_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER} -d ${PGDATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy: { resources: { limits: { cpus: "1", memory: 2g } } }
+
+  bisindo-app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      bisindo-db: { condition: service_healthy }
+    environment:
+      PGHOST: bisindo-db               # nama service, bukan localhost — keduanya satu jaringan bridge
+      PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE}
+      PGUSER: ${PGUSER}
+      PGPASSWORD: ${PGPASSWORD}
+      PORT: "3000"                     # di DALAM container; dipetakan ke 3100 di host
+      RECOGNITION_CONFIDENCE_THRESHOLD: ${RECOGNITION_CONFIDENCE_THRESHOLD:-0.75}
+      STABILITY_FRAMES: ${STABILITY_FRAMES:-8}
+    ports: ["127.0.0.1:3100:3000"]     # publik hanya lewat Caddy milik kampus-meet
+    # k-NN berjalan per frame di satu thread; dibatasi agar rekaman Egress tetap kebagian CPU
+    deploy: { resources: { limits: { cpus: "1.5", memory: 2g } } }
+
+volumes:
+  bisindo_pgdata:

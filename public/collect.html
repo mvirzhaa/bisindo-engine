@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Rekam Data Kosakata — BISINDO Engine</title>
+<style>
+  :root { --bg:#0b1220; --panel:#121a2b; --border:#22304a; --text:#e8edf7; --muted:#8ea0c2; --accent:#38bdf8; --ok:#34d399; --warn:#fbbf24; --danger:#f87171; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:'Segoe UI', system-ui, sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;}
+  header a { color:var(--accent); text-decoration:none; font-size:14px;}
+  main { display:flex; gap:20px; padding:20px 24px; max-width:1200px; margin:0 auto; flex-wrap:wrap; }
+  .video-wrap { position:relative; width:480px; max-width:100%; aspect-ratio:4/3; background:#000; border-radius:12px; overflow:hidden; border:1px solid var(--border);}
+  video, canvas { position:absolute; top:0; left:0; width:100%; height:100%; }
+  video { transform:scaleX(-1); }
+  canvas { transform:scaleX(-1); pointer-events:none; }
+  .panel { flex:1; min-width:340px; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px; }
+  label { font-size:13px; color:var(--muted); display:block; margin-top:12px; margin-bottom:4px; }
+  select, input, textarea { width:100%; padding:9px 10px; border-radius:8px; border:1px solid var(--border); background:#0a0f1c; color:var(--text); font-size:14px;}
+  button { background:var(--accent); color:#001018; border:none; padding:11px 18px; border-radius:8px; font-weight:600; cursor:pointer; margin-top:14px; }
+  button.danger { background: var(--danger); }
+  button.secondary { background: transparent; border:1px solid var(--border); color: var(--text); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .recBadge { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--danger); font-weight:600;}
+  .recBadge .d { width:9px; height:9px; border-radius:50%; background:var(--danger); animation:pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.2} }
+  table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:500; }
+  .pill { padding:2px 8px; border-radius:999px; font-size:11px; background:#1c2944; color:var(--muted); }
+  .pill.ok { background:#123327; color:var(--ok);}
+  .hint { font-size:12px; color:var(--muted); margin-top:14px; line-height:1.6; }
+  .frameCount { font-size:28px; font-weight:700; }
+</style>
+</head>
+<body>
+<header>
+  <div><strong>🎥 Rekam Data Kosakata — BISINDO</strong></div>
+  <a href="./index.html">← Kembali ke demo transkripsi</a>
+</header>
+
+<main>
+  <section>
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div style="margin-top:10px;" id="recStatus"></div>
+    <div class="hint">
+      1) Pilih kosakata yang mau direkam. 2) Klik <b>Mulai Rekam</b>, peragakan tandanya
+      (untuk huruf/angka statis cukup tahan pose selama rekaman; untuk kata dinamis lakukan
+      gerakan penuh dari awal sampai akhir). 3) Klik <b>Berhenti &amp; Simpan</b>.
+      Ulangi 10&ndash;20 kali per kosakata dengan sedikit variasi (posisi, kecepatan) agar model lebih kuat.
+    </div>
+  </section>
+
+  <section class="panel">
+    <label for="signSelect">Kosakata</label>
+    <select id="signSelect"></select>
+
+    <label for="contributorName">Nama perekam (opsional)</label>
+    <input id="contributorName" placeholder="mis. Budi" />
+
+    <div style="display:flex; gap:10px; align-items:center;">
+      <button id="btnRecord">● Mulai Rekam</button>
+      <button id="btnStopSave" class="secondary" disabled>Berhenti &amp; Simpan</button>
+      <button id="btnCancel" class="danger" disabled>Batal</button>
+    </div>
+    <div style="margin-top:10px;">Frame terekam: <span class="frameCount" id="frameCount">0</span></div>
+
+    <h3 style="margin-top:26px; font-size:14px; color:var(--muted); text-transform:uppercase;">Progres Data per Kosakata</h3>
+    <table>
+      <thead><tr><th>Gloss</th><th>Tipe</th><th>Jumlah Sampel</th></tr></thead>
+      <tbody id="countsBody"></tbody>
+    </table>
+  </section>
+</main>
+
+<script type="module">
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+import { HandTracker, drawLandmarks } from "./js/handTracker.js";
+
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const ctx = overlay.getContext("2d");
+const signSelect = document.getElementById("signSelect");
+const contributorName = document.getElementById("contributorName");
+const btnRecord = document.getElementById("btnRecord");
+const btnStopSave = document.getElementById("btnStopSave");
+const btnCancel = document.getElementById("btnCancel");
+const frameCountEl = document.getElementById("frameCount");
+const recStatus = document.getElementById("recStatus");
+const countsBody = document.getElementById("countsBody");
+
+let tracker = null;
+let recording = false;
+let recordedFrames = [];
+let rafId = null;
+
+async function loadSigns() {
+  const res = await fetch("./api/signs?language=BISINDO");
+  const { signs } = await res.json();
+  signSelect.innerHTML = signs
+    .map((s) => `<option value="${esc(s.id)}">${esc(s.gloss)} — ${esc(s.category)}/${esc(s.motion_type)}</option>`)
+    .join("");
+}
+
+async function loadCounts() {
+  const res = await fetch("./api/samples/counts");
+  const { counts } = await res.json();
+  countsBody.innerHTML = counts
+    .map(
+      (c) => `<tr>
+        <td>${esc(c.gloss)}</td>
+        <td>${esc(c.motion_type)}</td>
+        <td><span class="pill ${c.sample_count >= 10 ? "ok" : ""}">${c.sample_count}</span></td>
+      </tr>`
+    )
+    .join("");
+}
+
+async function setupCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+  video.srcObject = stream;
+  await new Promise((resolve) => (video.onloadedmetadata = resolve));
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+}
+
+function loop() {
+  const { hands } = tracker.detect(video);
+  drawLandmarks(ctx, overlay.width, overlay.height, hands);
+  if (recording && hands.length > 0) {
+    recordedFrames.push({ t: Date.now(), hands });
+    frameCountEl.textContent = recordedFrames.length;
+  }
+  rafId = requestAnimationFrame(loop);
+}
+
+btnRecord.onclick = () => {
+  recordedFrames = [];
+  frameCountEl.textContent = "0";
+  recording = true;
+  recStatus.innerHTML = `<span class="recBadge"><span class="d"></span> MEREKAM...</span>`;
+  btnRecord.disabled = true;
+  btnStopSave.disabled = false;
+  btnCancel.disabled = false;
+};
+
+btnCancel.onclick = () => {
+  recording = false;
+  recordedFrames = [];
+  frameCountEl.textContent = "0";
+  recStatus.textContent = "Dibatalkan.";
+  btnRecord.disabled = false;
+  btnStopSave.disabled = true;
+  btnCancel.disabled = true;
+};
+
+btnStopSave.onclick = async () => {
+  recording = false;
+  btnRecord.disabled = false;
+  btnStopSave.disabled = true;
+  btnCancel.disabled = true;
+
+  if (recordedFrames.length < 3) {
+    recStatus.textContent = "Terlalu sedikit frame, coba rekam lagi (minimal beberapa frame).";
+    return;
+  }
+
+  recStatus.textContent = "Menyimpan ke database...";
+  const res = await fetch("./api/samples", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      signId: signSelect.value,
+      landmarkSequence: recordedFrames,
+      contributorName: contributorName.value || null,
+    }),
+  });
+  if (res.ok) {
+    recStatus.textContent = `✅ Tersimpan (${recordedFrames.length} frame). Lanjutkan rekaman berikutnya.`;
+    loadCounts();
+  } else {
+    const err = await res.json();
+    recStatus.textContent = "⚠️ Gagal menyimpan: " + (err.error || res.statusText);
+  }
+};
+
+(async function main() {
+  await loadSigns();
+  await loadCounts();
+  tracker = new HandTracker();
+  await tracker.init({ numHands: 2 });
+  await setupCamera();
+  loop();
+})();
+</script>
+</body>
+</html>

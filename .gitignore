@@ -1,0 +1,8 @@
+node_modules/
+.env
+data/models/*.json
+!data/models/.gitkeep
+*.log
+
+# Dump database 135 MB - melebihi batas 100 MB GitHub. Didistribusikan lewat paket rilis.
+data/bisindo_engine_dump.sql

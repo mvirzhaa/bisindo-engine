@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Engine Transkripsi Bahasa Isyarat (BISINDO)</title>
+<style>
+  :root {
+    --bg: #0b1220; --panel: #121a2b; --border: #22304a; --text: #e8edf7;
+    --muted: #8ea0c2; --accent: #38bdf8; --accent2: #f472b6; --ok: #34d399; --warn: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: 'Segoe UI', system-ui, sans-serif; }
+  header { padding: 18px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;}
+  header h1 { font-size: 18px; margin:0; }
+  header a { color: var(--accent); text-decoration:none; font-size: 14px; }
+  main { display:flex; gap:20px; padding: 20px 24px; max-width: 1200px; margin: 0 auto; flex-wrap: wrap; }
+  .video-panel { position:relative; width: 560px; max-width: 100%; }
+  video, canvas { position:absolute; top:0; left:0; width:100%; border-radius:12px; }
+  video { transform: scaleX(-1); }
+  canvas { transform: scaleX(-1); pointer-events:none; }
+  .video-wrap { position:relative; width:100%; aspect-ratio: 4/3; background:#000; border-radius:12px; overflow:hidden; border:1px solid var(--border);}
+  .status-row { margin-top:10px; display:flex; gap:8px; align-items:center; font-size:13px; color:var(--muted); flex-wrap:wrap;}
+  .dot { width:9px; height:9px; border-radius:50%; background:#555; display:inline-block;}
+  .dot.on { background: var(--ok); }
+  .dot.off { background:#555; }
+  .controls { margin-top: 12px; display:flex; gap:10px; flex-wrap:wrap; }
+  button { background: var(--accent); color:#001018; border:none; padding:10px 16px; border-radius:8px; font-weight:600; cursor:pointer; }
+  button.secondary { background: transparent; border:1px solid var(--border); color: var(--text); }
+  button:disabled { opacity: .5; cursor:not-allowed; }
+  .panel { flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px; }
+  .panel h2 { margin-top:0; font-size:15px; color: var(--muted); text-transform:uppercase; letter-spacing:.05em;}
+  #transcript { min-height:160px; font-size:22px; line-height:1.5; background:#0a0f1c; border-radius:8px; padding:14px; border:1px solid var(--border); word-break:break-word;}
+  #liveGloss { font-size:14px; color: var(--muted); margin-top:10px; min-height: 20px; }
+  #liveGloss b { color: var(--accent); font-size:16px;}
+  .confidence-bar { height:6px; background:#1c2944; border-radius:3px; margin-top:4px; overflow:hidden; }
+  .confidence-bar > div { height:100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); width:0%; transition: width .15s; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 16px; line-height:1.6;}
+  .hint code { background:#0a0f1c; padding: 1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤟 Engine Transkripsi Bahasa Isyarat &mdash; BISINDO</h1>
+  <a href="./collect.html">Rekam data kosakata baru →</a>
+</header>
+
+<main>
+  <section class="video-panel">
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="status-row">
+      <span id="dotCam" class="dot off"></span> Kamera
+      <span id="dotWs" class="dot off"></span> Koneksi server
+      <span id="dotModel" class="dot off"></span> Model siap
+    </div>
+    <div class="controls">
+      <button id="btnStart">Mulai Transkripsi</button>
+      <button id="btnStop" class="secondary" disabled>Berhenti</button>
+      <button id="btnSpace" class="secondary" disabled>Spasi / Tutup Kata</button>
+    </div>
+    <div class="hint">
+      Cara pakai fingerspelling: tahan satu bentuk huruf BISINDO diam beberapa saat
+      sampai huruf muncul di transkrip, lalu ganti ke huruf berikutnya.
+      Untuk kata dinamis (mis. <code>HALO</code>, <code>TERIMA KASIH</code>), lakukan gerakan penuh lalu diam sejenak.
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Transkrip</h2>
+    <div id="transcript">&nbsp;</div>
+    <div id="liveGloss"></div>
+    <div class="confidence-bar"><div id="confBar"></div></div>
+  </section>
+</main>
+
+<script type="module">
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+import { HandTracker, drawLandmarks } from "./js/handTracker.js";
+
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const ctx = overlay.getContext("2d");
+const transcriptEl = document.getElementById("transcript");
+const liveGlossEl = document.getElementById("liveGloss");
+const confBar = document.getElementById("confBar");
+const dotCam = document.getElementById("dotCam");
+const dotWs = document.getElementById("dotWs");
+const dotModel = document.getElementById("dotModel");
+const btnStart = document.getElementById("btnStart");
+const btnStop = document.getElementById("btnStop");
+const btnSpace = document.getElementById("btnSpace");
+
+let tracker = null;
+let ws = null;
+let rafId = null;
+let running = false;
+
+async function setupCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+  video.srcObject = stream;
+  await new Promise((resolve) => (video.onloadedmetadata = resolve));
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+  dotCam.className = "dot on";
+}
+
+function connectSocket() {
+  // Relatif terhadap halaman supaya tetap benar saat dilayani di subpath (mis. /bisindo/)
+  const wsUrl = new URL("./ws/transcribe", location.href);
+  wsUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    dotWs.className = "dot on";
+    ws.send(JSON.stringify({ type: "start", displayName: "Pengguna Demo", signLanguage: "BISINDO" }));
+  };
+  ws.onclose = () => (dotWs.className = "dot off");
+  ws.onerror = () => (dotWs.className = "dot off");
+
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (msg.type === "ready") {
+      dotModel.className = "dot on";
+    } else if (msg.type === "error") {
+      liveGlossEl.textContent = "⚠️ " + msg.message;
+    } else if (msg.type === "recognition") {
+      transcriptEl.textContent = msg.transcriptSoFar || " ";
+      liveGlossEl.innerHTML = `Dikenali: <b>${esc(msg.gloss)}</b> (${msg.event === "word" ? "kata" : "huruf"})`;
+      confBar.style.width = `${Math.round((msg.confidence || 0) * 100)}%`;
+    } else if (msg.type === "transcript_update") {
+      transcriptEl.textContent = msg.transcriptSoFar || " ";
+    }
+  };
+}
+
+function loop() {
+  if (!running) return;
+  const { hands } = tracker.detect(video);
+  drawLandmarks(ctx, overlay.width, overlay.height, hands);
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "frame", hands }));
+  }
+  rafId = requestAnimationFrame(loop);
+}
+
+btnStart.onclick = async () => {
+  btnStart.disabled = true;
+  try {
+    if (!tracker) {
+      tracker = new HandTracker();
+      await tracker.init({ numHands: 2 });
+    }
+    await setupCamera();
+    connectSocket();
+    running = true;
+    btnStop.disabled = false;
+    btnSpace.disabled = false;
+    loop();
+  } catch (err) {
+    alert("Gagal memulai: " + err.message);
+    btnStart.disabled = false;
+  }
+};
+
+btnStop.onclick = () => {
+  running = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  if (ws) {
+    ws.send(JSON.stringify({ type: "stop" }));
+    ws.close();
+  }
+  if (video.srcObject) video.srcObject.getTracks().forEach((t) => t.stop());
+  dotCam.className = "dot off";
+  btnStart.disabled = false;
+  btnStop.disabled = true;
+  btnSpace.disabled = true;
+};
+
+btnSpace.onclick = () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "commit_word" }));
+  }
+};
+</script>
+</body>
+</html>
