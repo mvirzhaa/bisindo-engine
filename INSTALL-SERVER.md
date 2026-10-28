@@ -88,63 +88,75 @@ Harapan: `{"status":"ok","modelReady":true,…}`
 
 ## 5. Daftarkan rute /bisindo di Caddy
 
-Butuh kampus-meet yang sudah memuat titik sisip `import conf.d/app-*.caddy`
-(ada sejak commit yang menambahkan `deploy/conf.d/`). Pastikan dulu:
+Butuh kampus-meet yang sudah memuat titik sisip `import conf.d/app-*.caddy`. Pastikan dulu:
 
 ```bash
-grep -n "conf.d" /opt/kampusmeet/deploy/Caddyfile
+grep -c "conf.d" /opt/kampusmeet/deploy/Caddyfile      # harus > 0
 ```
 
-Lalu:
+Buat berkasnya dengan `printf`, **bukan heredoc** — paste heredoc sering terpotong di
+klien SSH dan menyisakan berkas kosong, yang membuat Caddy gagal start (bukan sekadar
+peringatan) sehingga seluruh situs meet ikut mati.
 
 ```bash
 mkdir -p /opt/kampusmeet/deploy/conf.d
-cat > /opt/kampusmeet/deploy/conf.d/app-bisindo.caddy <<'EOF'
-# Engine BISINDO dilayani di /bisindo (aplikasi terpisah di 127.0.0.1:3100).
-
-# Tanpa garis miring akhir, path relatif di halaman akan resolve ke root domain.
-redir /bisindo /bisindo/ 308
-
-# Endpoint ini tidak berautentikasi di aplikasinya -> tutup dari publik.
-# Muat ulang model dari dalam server:
-#   curl -X POST http://127.0.0.1:3100/api/admin/reload-model
-@bisindo_admin path /bisindo/api/admin/*
-respond @bisindo_admin 403
-
-# Menambah/mengubah kosakata hanya boleh dari dalam server:
-# POST /api/signs tidak berautentikasi dan nilainya ditampilkan di halaman.
-@bisindo_write {
-	path /bisindo/api/signs*
-	method POST PUT PATCH DELETE
-}
-respond @bisindo_write 403
-
-handle_path /bisindo/* {
-	reverse_proxy 127.0.0.1:3100 {
-		# Cookie sesi UIKA Meet tidak perlu — dan tidak boleh — sampai ke aplikasi lain
-		header_up -Cookie
-	}
-}
-EOF
-
-docker compose -f /opt/kampusmeet/deploy/docker-compose.yml --env-file /opt/kampusmeet/.env up -d caddy
-docker compose -f /opt/kampusmeet/deploy/docker-compose.yml --env-file /opt/kampusmeet/.env logs --tail=20 caddy
+printf '%s\n' '@bisindo_write {' '  path /api/signs*' '  method POST PUT PATCH DELETE' '}' '' 'redir /bisindo /bisindo/ 308' '' 'handle_path /bisindo/* {' '  route {' '    respond /api/admin/* 403' '    respond @bisindo_write 403' '    reverse_proxy 127.0.0.1:3100 {' '      header_up -Cookie' '    }' '  }' '}' > /opt/kampusmeet/deploy/conf.d/app-bisindo.caddy
+wc -l /opt/kampusmeet/deploy/conf.d/app-bisindo.caddy   # harus 16
 ```
 
-Folder `deploy/conf.d/` di-.gitignore, jadi berkas ini **tidak akan tertimpa `git pull`**.
+Tiga hal yang membuat konfigurasi ini bekerja — ketiganya hasil kesalahan nyata saat
+pemasangan pertama:
+
+1. **Blokir harus di DALAM `handle_path`, dibungkus `route`.** Caddy mengurutkan ulang
+   direktif: `handle_path` dievaluasi sebelum `respond` di tingkat yang sama, sehingga
+   `respond 403` di luar tidak pernah tercapai. `route` mempertahankan urutan penulisan.
+2. **Path di dalam `handle_path` sudah dilucuti prefiksnya** — tulis `/api/admin/*`,
+   bukan `/bisindo/api/admin/*`.
+3. **`redir` tanpa garis miring akhir wajib ada**, kalau tidak path relatif di halaman
+   akan resolve ke root domain (aplikasi meet).
+
+Validasi dulu, lalu reload:
+
+```bash
+cd /opt/kampusmeet
+docker compose -f deploy/docker-compose.yml --env-file .env exec caddy caddy validate --config /etc/caddy/Caddyfile
+docker compose -f deploy/docker-compose.yml --env-file .env exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+> **`docker compose up -d caddy` TIDAK cukup.** Bila definisi compose tidak berubah,
+> container tidak dibuat ulang dan Caddy tetap memakai konfigurasi lama di memori —
+> Caddy tidak memantau perubahan berkas. Setiap kali mengubah `deploy/conf.d/*.caddy`,
+> jalankan `caddy reload` (tanpa downtime).
+>
+> Peringatan `No files matching import glob pattern` untuk `site-*.caddy` itu normal —
+> glob itu memang belum dipakai.
 
 ## 6. Uji
 
 ```bash
-curl -s -o /dev/null -w "redirect  : %{http_code}\n" https://meet.uika-bogor.ac.id/bisindo
-curl -s -o /dev/null -w "halaman   : %{http_code}\n" https://meet.uika-bogor.ac.id/bisindo/
-curl -s                                              https://meet.uika-bogor.ac.id/bisindo/api/health
-curl -s -o /dev/null -w "admin     : %{http_code}\n" -X POST https://meet.uika-bogor.ac.id/bisindo/api/admin/reload-model
-curl -s -o /dev/null -w "meet utuh : %{http_code}\n" https://meet.uika-bogor.ac.id/
+R="--resolve meet.uika-bogor.ac.id:443:127.0.0.1"; B="https://meet.uika-bogor.ac.id"
+for u in "/bisindo" "/bisindo/" "/"; do curl -s -o /dev/null -w "$u -> %{http_code}\n" $R "$B$u"; done
+curl -s -o /dev/null -w "health       -> %{http_code}\n" $R "$B/bisindo/api/health"
+curl -s -o /dev/null -w "admin (POST) -> %{http_code}\n" $R -X POST "$B/bisindo/api/admin/reload-model"
+curl -s -o /dev/null -w "signs tulis  -> %{http_code}\n" $R -X POST -H 'Content-Type: application/json' -d '{}' "$B/bisindo/api/signs"
+curl -s -o /dev/null -w "signs baca   -> %{http_code}\n" $R "$B/bisindo/api/signs?language=BISINDO"
 ```
 
-Harapan: `308`, `200`, JSON `status:ok`, `403`, `200`.
-Baris terakhir memastikan aplikasi meet tidak terganggu rute baru ini.
+Harapan:
+
+```
+/bisindo -> 308
+/bisindo/ -> 200
+/ -> 200
+health       -> 200
+admin (POST) -> 403
+signs tulis  -> 403
+signs baca   -> 200
+```
+
+Baris `/ -> 200` memastikan rute baru tidak mengganggu aplikasi meet.
+Dua baris terakhir memastikan jalur XSS tertutup (tulis diblokir) tanpa mematikan
+`collect.html` (baca tetap jalan).
 
 Lalu buka `https://meet.uika-bogor.ac.id/bisindo/` di browser dan izinkan kamera.
 Perekam data latih: `/bisindo/collect.html`.
